@@ -30,6 +30,14 @@ STATUS_HOUR_VN = 7        # во сколько присылать утренн�
 EMA50_ZONE = True         # EMA 50 (4H) как динамическая зона: поддержка в лонг-контексте, сопротивление в шорт-контексте
 MAX_TRADES_DAY = 2        # напоминание в сигналах
 
+# Автоуровни: бот сам находит поддержки/сопротивления по свингам 4H
+AUTO_LEVELS = True
+AUTO_LOOKBACK = 180       # сколько свечей 4H смотреть (~30 дней)
+AUTO_PIVOT = 3            # свинг = экстремум среди 3 свечей слева и 3 справа
+AUTO_CLUSTER = 0.006      # свинги ближе 0,6% друг к другу = один уровень
+AUTO_MAX_DIST = 0.12      # уровни не дальше 12% от цены
+AUTO_PER_SIDE = 2         # сколько уровней снизу и сверху
+
 VN = timezone(timedelta(hours=7))
 API = "https://data-api.binance.vision/api/v3/klines"
 STATE_FILE = "state.json"
@@ -247,6 +255,78 @@ def breakout_state(c4, L, up):
     return ev, held
 
 
+# ===== АВТОУРОВНИ =====
+def auto_levels(c4):
+    """Свинги 4H -> кластеры -> ближайшие поддержки и сопротивления.
+    Возвращает (уровни, последний свинг-лоу ниже цены)."""
+    data = c4[-AUTO_LOOKBACK:]
+    k = AUTO_PIVOT
+    price = data[-1]["c"]
+    pivots = []  # (цена, индекс, 'H'/'L')
+    for i in range(k, len(data) - k):
+        win = data[i - k:i + k + 1]
+        if data[i]["h"] == max(x["h"] for x in win):
+            pivots.append((data[i]["h"], i, "H"))
+        if data[i]["l"] == min(x["l"] for x in win):
+            pivots.append((data[i]["l"], i, "L"))
+    if not pivots:
+        return [], None
+
+    # кластеры близких свингов
+    clusters = []
+    for pr, i, kind in sorted(pivots):
+        if clusters and abs(pr - clusters[-1]["mean"]) <= clusters[-1]["mean"] * AUTO_CLUSTER:
+            c = clusters[-1]
+            c["pts"].append(pr)
+            c["mean"] = sum(c["pts"]) / len(c["pts"])
+            c["last"] = max(c["last"], i)
+        else:
+            clusters.append({"pts": [pr], "mean": pr, "last": i})
+
+    last_low = None
+    lows_below = [(i, pr) for pr, i, kind in pivots if kind == "L" and pr < price]
+    if lows_below:
+        last_low = max(lows_below)[1]
+
+    def pick(side):
+        if side == "support":
+            cand = [c for c in clusters if c["mean"] < price * 0.999 and c["mean"] > price * (1 - AUTO_MAX_DIST)]
+            cand.sort(key=lambda c: -c["mean"])
+        else:
+            cand = [c for c in clusters if c["mean"] > price * 1.001 and c["mean"] < price * (1 + AUTO_MAX_DIST)]
+            cand.sort(key=lambda c: c["mean"])
+        strong = [c for c in cand if len(c["pts"]) >= 2]
+        chosen = strong[:AUTO_PER_SIDE]
+        if cand and cand[0] not in chosen and len(chosen) < AUTO_PER_SIDE + 1:
+            chosen.insert(0, cand[0])  # ближайший свинг, даже одиночный
+        return chosen
+
+    out = []
+    for side in ("support", "resistance"):
+        chosen = pick(side)
+        for n, c in enumerate(chosen):
+            lvl = {"price": round(c["mean"], 8), "type": side, "comment": f"авто, касаний {len(c['pts'])}",
+                   "auto": True, "touches": len(c["pts"])}
+            out.append(lvl)
+        strong = [c for c in chosen if len(c["pts"]) >= 2]
+        if strong:
+            nearest = min(strong, key=lambda c: abs(c["mean"] - price))
+            out.append({"price": round(nearest["mean"], 8),
+                        "type": "break_up" if side == "resistance" else "break_down",
+                        "comment": "авто", "auto": True, "touches": len(nearest["pts"])})
+    return out, last_low
+
+
+def merge_auto(manual, auto):
+    """Ручные уровни главнее: автоуровень рядом с ручным (±0,8%) отбрасывается."""
+    res = list(manual)
+    for a in auto:
+        if any(abs(a["price"] - m["price"]) <= m["price"] * ZONE_PCT * 2 for m in manual):
+            continue
+        res.append(a)
+    return res
+
+
 # ===== РАСЧЁТ ПОЗИЦИИ =====
 def fmt(x):
     if x is None:
@@ -393,16 +473,27 @@ def main():
         sym = coin + "USDT"
         data[coin] = {"c4": klines(sym, "4h", 1000), "c1": klines(sym, "1h", 100)}
 
-    # фильтр BTC для альтов
+    # автоуровни
+    btc_auto_low = None
+    if AUTO_LEVELS:
+        for coin in COINS:
+            if len(data[coin]["c4"]) < AUTO_LOOKBACK:
+                continue
+            auto, last_low = auto_levels(data[coin]["c4"])
+            levels[coin] = merge_auto(levels[coin], auto)
+            if coin == "BTC":
+                btc_auto_low = last_low
+
+    # фильтр BTC для альтов: ручной btc_filter из таблицы, иначе — последний свинг-лоу 4H
     btc_f = [l for l in levels["BTC"] if l["type"] == "btc_filter"]
     btc_close4 = data["BTC"]["c4"][-1]["c"]
-    if btc_f:
-        L = btc_f[0]["price"]
+    L, src = (btc_f[0]["price"], "таблица") if btc_f else (btc_auto_low, "авто: последний свинг-лоу 4H")
+    if L:
         btc_ok = btc_close4 > L
-        btc_line = (f"BTC 4H закрыт {fmt(btc_close4)} > {fmt(L)} ✅" if btc_ok
-                    else f"⛔ BTC 4H закрыт {fmt(btc_close4)} < {fmt(L)} — лонги по альтам запрещены")
+        btc_line = (f"BTC 4H закрыт {fmt(btc_close4)} > {fmt(L)} ({src}) ✅" if btc_ok
+                    else f"⛔ BTC 4H закрыт {fmt(btc_close4)} < {fmt(L)} ({src}) — лонги по альтам запрещены")
     else:
-        btc_ok, btc_line = None, "BTC-фильтр не задан в таблице (строка btc_filter)"
+        btc_ok, btc_line = None, "BTC-фильтр: поддержка не найдена"
 
     status_rows = []
     for coin in COINS:
@@ -436,16 +527,17 @@ def main():
             up = l["type"] == "break_up"
             ev, held = breakout_state(c4, l["price"], up)
             word = "выше" if up else "ниже"
+            tag = " (авто)" if l.get("auto") else ""
             if new_4h and ev == "first":
-                events.append(f"🔵 <b>ПРОБОЙ?</b> 4H закрылась {word} {fmt(l['price'])}.\n"
+                events.append(f"🔵 <b>ПРОБОЙ?</b> 4H закрылась {word} {fmt(l['price'])}{tag}.\n"
                               f"Ждём следующую 4H: если не закроется обратно — пробой засчитан. Сейчас НЕ входим.")
             elif new_4h and ev == "confirmed":
-                events.append(f"✅ <b>ПРОБОЙ ПОДТВЕРЖДЁН</b> {fmt(l['price'])} (2 закрытия 4H {word}).\n"
+                events.append(f"✅ <b>ПРОБОЙ ПОДТВЕРЖДЁН</b> {fmt(l['price'])}{tag} (2 закрытия 4H {word}).\n"
                               f"Ждём ретест уровня + подтверждение на 1H. Без ретеста — пропускаем.")
             elif new_4h and ev == "failed":
                 events.append(f"❌ <b>Пробой {fmt(l['price'])} не удержали</b> — 4H закрылась обратно. Сценарий отменён.")
             if held:
-                (supports if up else resists).append({"price": l["price"], "type": "retest", "comment": "ретест пробоя"})
+                (supports if up else resists).append({"price": l["price"], "type": "retest", "comment": "ретест пробоя", "auto": l.get("auto", False)})
 
         # --- зоны и подтверждения на закрытии 1H ---
         if new_1h:
@@ -455,6 +547,8 @@ def main():
                     L = l["price"]
                     hit_now, hit_prev = touched(c, L), touched(p, L)
                     label = {"retest": "РЕТЕСТ", "ema50": "EMA 50 (4H)"}.get(l["type"], "ЗОНА")
+                    if l.get("auto"):
+                        label += " (авто)"
                     side_txt = "лонг" if side == "long" else "шорт"
                     if hit_now and not hit_prev:
                         events.append(f"🟡 <b>{label} {fmt(L)}</b> ({side_txt}) — цена в зоне. Жди подтверждение на 1H.")
@@ -474,7 +568,7 @@ def main():
                             blockers.append(f"ATR {atr:.1f}% — слишком нервная")
                         if blackout:
                             blockers.append(f"новостное окно: {n_esc(blackout['name'])}")
-                        where = (label + " ") if l["type"] == "ema50" else ""
+                        where = (label + " ") if l["type"] == "ema50" or l.get("auto") else ""
                         events.append(
                             f"🟢 <b>ПОДТВЕРЖДЕНИЕ 1H</b> ({side_txt}) у {where}{fmt(L)}: {patt}\n\n"
                             + plan(coin, side, c1, lv, settings, blockers))
@@ -496,7 +590,17 @@ def main():
         if near_s:
             ns = max(near_s)
             near_txt = f", до поддержки {fmt(ns)}: {(c1[-1]['c'] - ns) / c1[-1]['c'] * 100:.1f}%"
-        status_rows.append(f"<b>{coin}</b> {fmt(c1[-1]['c'])} — {TREND_TXT[tr]}, ATR {atr:.1f}%{near_txt}")
+        def lv_txt(group):
+            return ", ".join(fmt(x["price"]) + ("ᵃ" if x.get("auto") else "") for x in sorted(group, key=lambda x: -x["price"])) or "—"
+        price_now = c1[-1]["c"]
+        uniq = {}
+        for x in supports + resists + [y for y in lv if y["type"] in ("break_up", "break_down")]:
+            if x["type"] != "ema50":
+                uniq.setdefault(round(x["price"], 8), x)
+        sup_l = [x for x in uniq.values() if x["price"] < price_now]
+        res_l = [x for x in uniq.values() if x["price"] >= price_now]
+        status_rows.append(f"<b>{coin}</b> {fmt(c1[-1]['c'])} — {TREND_TXT[tr]}, ATR {atr:.1f}%{near_txt}\n"
+                           f"   ↑ {lv_txt(res_l)}\n   ↓ {lv_txt(sup_l)}")
 
     # утренний статус / ручной запуск
     today = now.strftime("%Y-%m-%d")
@@ -506,6 +610,7 @@ def main():
         send_tg(f"🤖 <b>Статус {now:%d.%m %H:%M}</b>"
                 + (" (ручной запуск)" if MANUAL else "") + "\n\n"
                 + "\n".join(status_rows) + f"\n\n{btc_line}\n\n<b>Новости:</b>\n{nl}\n\n"
+                f"ᵃ — уровень найден автоматически по свингам 4H. Сверь с графиком.\n"
                 f"Риск ${settings['risk_usd']:.2f} | депозит ${settings['deposit']:.0f}")
         if not MANUAL:
             st["status_date"] = today
