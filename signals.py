@@ -191,15 +191,17 @@ def trend_4h(c4):
     c = closes[-1]
     if e50 is None or e200 is None:
         return "?", e50, e200
-    if c > e200 and e50 > e200:
+    # цена ушла за EMA 50 дальше чем на 1 ATR — структура под вопросом, направление «неясно»
+    atr_abs = (atr_pct(c4) or 0) * c / 100
+    if c > e200 and e50 > e200 and c >= e50 - atr_abs:
         return "long", e50, e200
-    if c < e200 and e50 < e200:
+    if c < e200 and e50 < e200 and c <= e50 + atr_abs:
         return "short", e50, e200
     return "flat", e50, e200
 
 
 TREND_TXT = {"long": "📈 лонг-контекст", "short": "📉 шорт-контекст",
-             "flat": "↔️ неясно (EMA перепутаны)", "?": "?"}
+             "flat": "↔️ неясно (пропускаем)", "?": "?"}
 
 
 # ===== ПАТТЕРНЫ 1H =====
@@ -295,11 +297,8 @@ def auto_levels(c4):
         else:
             cand = [c for c in clusters if c["mean"] > price * 1.001 and c["mean"] < price * (1 + AUTO_MAX_DIST)]
             cand.sort(key=lambda c: c["mean"])
-        strong = [c for c in cand if len(c["pts"]) >= 2]
-        chosen = strong[:AUTO_PER_SIDE]
-        if cand and cand[0] not in chosen and len(chosen) < AUTO_PER_SIDE + 1:
-            chosen.insert(0, cand[0])  # ближайший свинг, даже одиночный
-        return chosen
+        strong = [c for c in cand if len(c["pts"]) >= 2]  # только уровни с 2+ касаниями
+        return strong[:AUTO_PER_SIDE]
 
     out = []
     for side in ("support", "resistance"):
