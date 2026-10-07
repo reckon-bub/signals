@@ -1,0 +1,41 @@
+name: signals
+
+on:
+  schedule:
+    - cron: "3 * * * *"   # каждый час в :03 (UTC, но для почасового запуска это неважно)
+  workflow_dispatch:       # кнопка «Run workflow» = ручной запуск + статус в Telegram
+
+permissions:
+  contents: write          # чтобы сохранять state.json (антиспам)
+
+concurrency:
+  group: signals
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan market
+        run: python3 signals.py
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          LEVELS_CSV_URL: ${{ secrets.LEVELS_CSV_URL }}
+          NEWS_CSV_URL: ${{ secrets.NEWS_CSV_URL }}
+          MANUAL: ${{ github.event_name == 'workflow_dispatch' }}
+
+      - name: Save state
+        if: always()
+        run: |
+          [ -f state.json ] || exit 0
+          git config user.name "signals-bot"
+          git config user.email "signals-bot@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet && exit 0
+          git commit -m "state"
+          git pull --rebase
+          git push
