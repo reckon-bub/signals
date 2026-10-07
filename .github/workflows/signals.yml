@@ -2,7 +2,7 @@ name: signals
 
 on:
   schedule:
-    - cron: "3 * * * *"   # каждый час в :03 (UTC, но для почасового запуска это неважно)
+    - cron: "11 * * * *"   # каждый час в :03 (UTC, но для почасового запуска это неважно)
   workflow_dispatch:       # кнопка «Run workflow» = ручной запуск + статус в Telegram
 
 permissions:
