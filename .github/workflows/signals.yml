@@ -2,8 +2,10 @@ name: signals
 
 on:
   schedule:
-    - cron: "11 * * * *"   # каждый час в :11 (UTC, но для почасового запуска это неважно)
-  workflow_dispatch:       # кнопка «Run workflow» = ручной запуск + статус в Telegram
+    - cron: "11 * * * *"   # запасной вариант (GitHub может опаздывать)
+  workflow_dispatch:       # кнопка «Run workflow» = ручной запуск + статус
+  repository_dispatch:     # точный будильник с cron-job.org
+    types: [tick]
 
 permissions:
   contents: write          # чтобы сохранять state.json (антиспам)
