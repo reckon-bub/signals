@@ -13,6 +13,8 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
+import re
 from datetime import datetime, timedelta, timezone
 
 # ===== НАСТРОЙКИ =====
@@ -63,19 +65,34 @@ def http_get(url, tries=3):
     raise RuntimeError(f"GET {url[:80]}... не удался: {last}")
 
 
+def _tg_post(text, html):
+    params = {"chat_id": TG_CHAT_ID, "text": text[:4000], "disable_web_page_preview": "true"}
+    if html:
+        params["parse_mode"] = "HTML"
+    req = urllib.request.Request(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                                 data=urllib.parse.urlencode(params).encode())
+    with urllib.request.urlopen(req, timeout=20) as r:
+        r.read()
+
+
 def send_tg(text):
+    """Отправка в Telegram. Если HTML не прошёл — шлём тот же текст без разметки. Никогда не роняет бота."""
     if not TG_TOKEN or not TG_CHAT_ID:
         print("---- TG (нет токена) ----\n" + text + "\n")
         return
-    data = urllib.parse.urlencode({
-        "chat_id": TG_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": "true",
-    }).encode()
-    req = urllib.request.Request(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data=data)
-    with urllib.request.urlopen(req, timeout=20) as r:
-        r.read()
+    try:
+        _tg_post(text, True)
+        return
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "ignore")[:200]
+        print("TG HTML error:", e.code, detail)
+    except Exception as e:  # noqa
+        print("TG error:", e)
+    plain = re.sub(r"<[^>]+>", "", text).replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+    try:
+        _tg_post(plain, False)
+    except Exception as e:  # noqa
+        print("TG plain error:", e)
 
 
 def klines(symbol, interval, limit):
@@ -489,8 +506,8 @@ def main():
     L, src = (btc_f[0]["price"], "таблица") if btc_f else (btc_auto_low, "авто: последний свинг-лоу 4H")
     if L:
         btc_ok = btc_close4 > L
-        btc_line = (f"BTC 4H закрыт {fmt(btc_close4)} > {fmt(L)} ({src}) ✅" if btc_ok
-                    else f"⛔ BTC 4H закрыт {fmt(btc_close4)} < {fmt(L)} ({src}) — лонги по альтам запрещены")
+        btc_line = (f"BTC 4H закрыт {fmt(btc_close4)} — выше {fmt(L)} ({src}) ✅" if btc_ok
+                    else f"⛔ BTC 4H закрыт {fmt(btc_close4)} — ниже {fmt(L)} ({src}), лонги по альтам запрещены")
     else:
         btc_ok, btc_line = None, "BTC-фильтр: поддержка не найдена"
 
@@ -603,7 +620,7 @@ def main():
 
     # утренний статус / ручной запуск
     today = now.strftime("%Y-%m-%d")
-    if MANUAL or (now.hour == STATUS_HOUR_VN and st.get("status_date") != today):
+    if MANUAL or (now.hour >= STATUS_HOUR_VN and st.get("status_date") != today):
         upcoming = [n for n in news if now <= n["dt"] <= now + timedelta(hours=36)]
         nl = "\n".join(f"• {n['dt']:%d.%m %H:%M} — {n_esc(n['name'])}" for n in upcoming) or "• Tier 1 в ближайшие 36 ч нет"
         send_tg(f"🤖 <b>Статус {now:%d.%m %H:%M}</b>"
@@ -626,6 +643,6 @@ if __name__ == "__main__":
         main()
     except Exception as e:  # noqa
         try:
-            send_tg(f"⚠️ Бот сигналов упал: {n_esc(e)}")
+            send_tg(f"⚠️ Бот сигналов упал: {n_esc(type(e).__name__)}: {n_esc(e)}")
         finally:
             raise
