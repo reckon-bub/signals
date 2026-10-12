@@ -18,7 +18,13 @@ import re
 from datetime import datetime, timedelta, timezone
 
 # ===== НАСТРОЙКИ =====
-COINS = ["BTC", "ETH", "SOL", "LINK", "BNB", "XRP"]
+COINS = ["BTC", "ETH", "SOL", "LINK", "BNB", "XRP",
+         "ADA", "AVAX", "DOT", "LTC", "BCH", "NEAR", "SUI", "TRX", "ATOM"]
+# Новые монеты — риск 0,5R первые 2 недели (до 26.10.2026). Потом убрать из списка.
+HALF_RISK = {"ADA", "AVAX", "DOT", "LTC", "BCH", "NEAR", "SUI", "TRX", "ATOM"}
+QUIET = True              # тихий режим: не присылать сигналы против тренда/силы
+RS_SHORT_BARS = 42        # сила vs BTC: 7 дней (42 свечи 4H)
+RS_LONG_BARS = 180        # и 30 дней
 ZONE_PCT = 0.004          # ширина зоны вокруг уровня: ±0,4%
 ATR_MAX = 5.0             # ATR(14) 4H в % от цены — выше этого монета «слишком нервная»
 NEWS_BEFORE_H = 2         # Tier 1: не входим за 2 часа до выхода
@@ -360,8 +366,10 @@ def fmt(x):
 
 
 # Шаг цены и количества на Bybit (USDT Perpetual). Проверь в карточке контракта, если ордер не принимается.
-PRICE_DEC = {"BTC": 1, "ETH": 2, "SOL": 2, "LINK": 3, "BNB": 2, "XRP": 4}
-QTY_STEP = {"BTC": 0.001, "ETH": 0.01, "SOL": 0.1, "LINK": 0.1, "BNB": 0.01, "XRP": 1}
+PRICE_DEC = {"BTC": 1, "ETH": 2, "SOL": 2, "LINK": 3, "BNB": 2, "XRP": 4,
+             "ADA": 4, "AVAX": 3, "DOT": 3, "LTC": 2, "BCH": 2, "NEAR": 3, "SUI": 4, "TRX": 5, "ATOM": 3}
+QTY_STEP = {"BTC": 0.001, "ETH": 0.01, "SOL": 0.1, "LINK": 0.1, "BNB": 0.01, "XRP": 1,
+            "ADA": 1, "AVAX": 0.1, "DOT": 0.1, "LTC": 0.1, "BCH": 0.01, "NEAR": 0.1, "SUI": 10, "TRX": 1, "ATOM": 0.1}
 
 
 def px(coin, x):
@@ -369,23 +377,44 @@ def px(coin, x):
     return f"{x:.{PRICE_DEC.get(coin, 4)}f}"
 
 
-def plan(coin, side, c1, all_levels, settings, blockers):
+def plan(coin, side, c1, all_levels, settings, blockers, L=None, atr_pct4=None):
     """Карточка ордера. Если есть хоть один блокер — вместо карточки «ПРОПУСКАЕМ»."""
     blockers = list(blockers)
-    entry = c1[-1]["c"]
-    last = c1[-SWING_BARS:]
+    price_now = c1[-1]["c"]
+    entry = price_now
+    chase_note = ""
+    # Вход: если цена ушла от уровня дальше 0,5 ATR(4H) — не догоняем, лимитка на уровне
+    if L and atr_pct4:
+        max_gap = price_now * atr_pct4 / 100 * 0.5
+        if abs(price_now - L) > max_gap:
+            entry = L
+            chase_note = (f"⏳ Цена сейчас {fmt(price_now)} — ушла от уровня. Не догоняем: "
+                          f"лимитка на уровне, ждём отката. Нет отката до следующего сигнала — отменить.")
+    recent = c1[-24:]
     if side == "long":
-        stop = min(x["l"] for x in last) * (1 - STOP_BUFFER)
+        # стоп под минимумом всех свечей, касавшихся зоны за сутки (учёт проколов), иначе — за 6 свечей
+        near = [x["l"] for x in recent if L and x["l"] <= L * (1 + ZONE_PCT)]
+        base = min(near) if near else min(x["l"] for x in c1[-SWING_BARS:])
+        stop = min(base, min(x["l"] for x in c1[-SWING_BARS:])) * (1 - STOP_BUFFER)
         targets = sorted(l["price"] for l in all_levels if l["price"] > entry * 1.003)
     else:
-        stop = max(x["h"] for x in last) * (1 + STOP_BUFFER)
+        near = [x["h"] for x in recent if L and x["h"] >= L * (1 - ZONE_PCT)]
+        base = max(near) if near else max(x["h"] for x in c1[-SWING_BARS:])
+        stop = max(base, max(x["h"] for x in c1[-SWING_BARS:])) * (1 + STOP_BUFFER)
         targets = sorted((l["price"] for l in all_levels if l["price"] < entry * 0.997), reverse=True)
+    if (side == "long" and stop >= entry) or (side == "short" and stop <= entry):
+        return "⛔ Стоп не посчитался — смотри график."
+    # стоп не ближе 0,5 ATR(4H) — иначе выбьет шумом
+    if atr_pct4:
+        min_d = entry * atr_pct4 / 100 * 0.5
+        if abs(entry - stop) < min_d:
+            stop = entry - min_d if side == "long" else entry + min_d
     target = targets[0] if targets else None
     dist = abs(entry - stop)
     if dist <= 0:
         return "⛔ Стоп не посчитался — смотри график."
 
-    risk = settings["risk_usd"]
+    risk = settings["risk_usd"] * (0.5 if coin in HALF_RISK else 1)
     dep = settings["deposit"]
     step = QTY_STEP.get(coin, 0.001)
     qty = int(risk / dist / step) * step
@@ -424,13 +453,14 @@ def plan(coin, side, c1, all_levels, settings, blockers):
     qty_txt = f"{qty:.{max(0, len(str(step).split('.')[-1]) if step < 1 else 0)}f}"
     return "\n".join([
         f"📋 <b>ОРДЕР {coin}USDT — {side_ru}</b>",
-        f"Вход (лимит):  <code>{px(coin, entry)}</code>",
+        f"Вход (лимит):  <code>{px(coin, entry)}</code>" + ("" if entry == price_now else "  ← уровень"),
         f"Стоп-лосс:      <code>{px(coin, stop)}</code>  (−{dist / entry * 100:.2f}%)",
         f"Тейк-профит:  <code>{px(coin, target)}</code>",
         f"Кол-во:            <code>{qty_txt}</code> {coin}  (≈${notional:.0f})",
         f"Плечо:             <b>{lev}x Isolated</b>, маржа ≈ ${margin:.0f}",
-        f"Риск ${risk_real:.2f} | R:R {rr:.1f} (с комиссией {rr_net:.1f}) | ликв. ≈ {fmt(liq)}",
+        f"Риск ${risk_real:.2f}" + (" (0,5R — новая монета)" if coin in HALF_RISK else "") + f" | R:R {rr:.1f} (с комиссией {rr_net:.1f}) | ликв. ≈ {fmt(liq)}",
         "",
+        *( [chase_note] if chase_note else [] ),
         "✔️ TP/SL ставь прямо в ордере, после исполнения проверь их в карточке позиции.",
         "⚠️ Цифры механические: сверь стоп со свингом и цель с уровнем 4H на своём графике.",
     ])
@@ -485,9 +515,30 @@ def main():
     st["news_warned"] = st["news_warned"][-30:]
 
     data = {}
+    failed = []
     for coin in COINS:
         sym = coin + "USDT"
-        data[coin] = {"c4": klines(sym, "4h", 1000), "c1": klines(sym, "1h", 100)}
+        try:
+            data[coin] = {"c4": klines(sym, "4h", 1000), "c1": klines(sym, "1h", 100)}
+        except Exception as e:  # noqa
+            print("fetch fail", coin, e)
+            failed.append(coin)
+            data[coin] = {"c4": [], "c1": []}
+    if not data["BTC"]["c4"]:
+        raise RuntimeError("нет данных по BTC")
+
+    # сила монеты относительно BTC (7 и 30 дней)
+    def rs(coin):
+        c4, b4 = data[coin]["c4"], data["BTC"]["c4"]
+        if coin == "BTC" or len(c4) <= RS_LONG_BARS or len(b4) <= RS_LONG_BARS:
+            return None, None, "base"
+        out = []
+        for n in (RS_SHORT_BARS, RS_LONG_BARS):
+            out.append(((c4[-1]["c"] / c4[-1 - n]["c"]) / (b4[-1]["c"] / b4[-1 - n]["c"]) - 1) * 100)
+        r7, r30 = out
+        tag = "strong" if r7 > 0 and r30 > 0 else "weak" if r7 < 0 and r30 < 0 else "mixed"
+        return r7, r30, tag
+    RS_TXT = {"strong": "💪 сильнее BTC", "weak": "🥀 слабее BTC", "mixed": "≈ как BTC", "base": "база"}
 
     # автоуровни
     btc_auto_low = None
@@ -519,6 +570,8 @@ def main():
         sym = coin + "USDT"
         tr, e50, e200 = trend_4h(c4)
         atr = atr_pct(c4)
+        r7, r30, rs_tag = rs(coin)
+        rs_line = (f"Сила vs BTC: {r7:+.1f}% (7д), {r30:+.1f}% (30д) — {RS_TXT[rs_tag]}" if r7 is not None else "")
         atr_line = f"ATR 4H {atr:.1f}% " + ("✅" if atr <= ATR_MAX else "⛔ слишком нервная")
         lv = levels[coin]
         new_1h = c1[-1]["t"] > st["last_1h"].get(sym, 0)
@@ -544,6 +597,11 @@ def main():
             ev, held = breakout_state(c4, l["price"], up)
             word = "выше" if up else "ниже"
             tag = " (авто)" if l.get("auto") else ""
+            show_bo = not QUIET or (up and tr == "long") or ((not up) and tr == "short")
+            if not show_bo:
+                ev = None
+            if QUIET and ev == "failed":
+                ev = None
             if new_4h and ev == "first":
                 events.append(f"🔵 <b>ПРОБОЙ?</b> 4H закрылась {word} {fmt(l['price'])}{tag}.\n"
                               f"Ждём следующую 4H: если не закроется обратно — пробой засчитан. Сейчас НЕ входим.")
@@ -566,6 +624,10 @@ def main():
                     if l.get("auto"):
                         label += " (авто)"
                     side_txt = "лонг" if side == "long" else "шорт"
+                    aligned = (tr == side) and not (side == "long" and rs_tag == "weak") \
+                        and not (side == "short" and rs_tag == "strong")
+                    if QUIET and not aligned:
+                        continue
                     if hit_now and not hit_prev:
                         events.append(f"🟡 <b>{label} {fmt(L)}</b> ({side_txt}) — цена в зоне. Жди подтверждение на 1H.")
                     if not (hit_now or hit_prev):
@@ -584,13 +646,19 @@ def main():
                             blockers.append(f"ATR {atr:.1f}% — слишком нервная")
                         if blackout:
                             blockers.append(f"новостное окно: {n_esc(blackout['name'])}")
+                        if side == "long" and rs_tag == "weak":
+                            blockers.append("монета слабее BTC — лонг не берём")
+                        if side == "short" and rs_tag == "strong":
+                            blockers.append("монета сильнее BTC — шорт не берём")
                         where = (label + " ") if l["type"] == "ema50" or l.get("auto") else ""
+                        card = plan(coin, side, c1, lv, settings, blockers, L=L, atr_pct4=atr)
+                        if QUIET and card.startswith("⛔"):
+                            continue
                         events.append(
-                            f"🟢 <b>ПОДТВЕРЖДЕНИЕ 1H</b> ({side_txt}) у {where}{fmt(L)}: {patt}\n\n"
-                            + plan(coin, side, c1, lv, settings, blockers))
+                            f"🟢 <b>ПОДТВЕРЖДЕНИЕ 1H</b> ({side_txt}) у {where}{fmt(L)}: {patt}\n\n" + card)
 
         if events:
-            head = f"<b>{coin}</b> {fmt(c1[-1]['c'])} | {TREND_TXT[tr]}\n{atr_line}\n"
+            head = f"<b>{coin}</b> {fmt(c1[-1]['c'])} | {TREND_TXT[tr]}\n{atr_line}\n" + (rs_line + "\n" if rs_line else "")
             if coin != "BTC":
                 head += btc_line + "\n"
             head += news_line + "\n\n"
@@ -615,18 +683,28 @@ def main():
                 uniq.setdefault(round(x["price"], 8), x)
         sup_l = [x for x in uniq.values() if x["price"] < price_now]
         res_l = [x for x in uniq.values() if x["price"] >= price_now]
-        status_rows.append(f"<b>{coin}</b> {fmt(c1[-1]['c'])} — {TREND_TXT[tr]}, ATR {atr:.1f}%{near_txt}\n"
-                           f"   ↑ {lv_txt(res_l)}\n   ↓ {lv_txt(sup_l)}")
+        rs_short = (f", {RS_TXT[rs_tag]} ({r7:+.0f}%/{r30:+.0f}%)" if r7 is not None else "")
+        status_rows.append(f"<b>{coin}</b> {fmt(c1[-1]['c'])} — {TREND_TXT[tr]}, ATR {atr:.1f}%{rs_short}\n"
+                           f"   ↑ {lv_txt(sorted(res_l, key=lambda x: x['price'])[:2])}\n"
+                           f"   ↓ {lv_txt(sorted(sup_l, key=lambda x: -x['price'])[:2])}")
 
     # утренний статус / ручной запуск
     today = now.strftime("%Y-%m-%d")
     if MANUAL or (now.hour >= STATUS_HOUR_VN and st.get("status_date") != today):
         upcoming = [n for n in news if now <= n["dt"] <= now + timedelta(hours=36)]
         nl = "\n".join(f"• {n['dt']:%d.%m %H:%M} — {n_esc(n['name'])}" for n in upcoming) or "• Tier 1 в ближайшие 36 ч нет"
-        send_tg(f"🤖 <b>Статус {now:%d.%m %H:%M}</b>"
-                + (" (ручной запуск)" if MANUAL else "") + "\n\n"
-                + "\n".join(status_rows) + f"\n\n{btc_line}\n\n<b>Новости:</b>\n{nl}\n\n"
-                f"ᵃ — уровень найден автоматически по свингам 4H. Сверь с графиком.\n"
+        head = f"🤖 <b>Статус {now:%d.%m %H:%M}</b>" + (" (ручной запуск)" if MANUAL else "")
+        chunk = head
+        for row in status_rows:
+            if len(chunk) + len(row) > 3500:
+                send_tg(chunk)
+                chunk = ""
+            chunk += "\n\n" + row if chunk else row
+        send_tg(chunk)
+        send_tg(f"{btc_line}\n\n<b>Новости:</b>\n{nl}\n\n"
+                + (f"⚠️ Нет данных: {', '.join(failed)}\n" if failed else "")
+                + f"ᵃ — уровень найден автоматически по свингам 4H. Сверь с графиком.\n"
+                f"Тихий режим: {'вкл' if QUIET else 'выкл'}. Новые монеты — риск 0,5R.\n"
                 f"Риск ${settings['risk_usd']:.2f} | депозит ${settings['deposit']:.0f}")
         if not MANUAL:
             st["status_date"] = today
