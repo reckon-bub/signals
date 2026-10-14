@@ -44,6 +44,8 @@ DEFAULT_DEPOSIT = 468.0
 MMR = 0.005               # поддерживающая маржа (оценка ликвидации)
 STOP_BUFFER = 0.001       # +0,1% за свинг
 MIN_RR = 2.0
+COOLDOWN_H = 3            # после карточки — 3 часа тишины по входам
+MAX_CARDS_DAY = 3         # не больше 3 карточек в день
 STATUS_HOUR_VN = 7
 
 AUTO_PIVOT = 3            # свинг = экстремум среди 3 свечей слева и 3 справа
@@ -153,7 +155,7 @@ def load_csv(url):
 
 def load_levels():
     levels = {c: [] for c in COINS}
-    settings = {"risk_usd": DEFAULT_RISK, "deposit": DEFAULT_DEPOSIT}
+    settings = {"risk_usd": DEFAULT_RISK, "deposit": DEFAULT_DEPOSIT, "position_open": 0}
     for r in load_csv(LEVELS_CSV_URL):
         typ = r.get("type", "").lower()
         price = parse_num(r.get("price", ""))
@@ -481,6 +483,7 @@ def main():
         return "strong" if r[0] > 0 and r[1] > 0 else "weak" if r[0] < 0 and r[1] < 0 else "mixed"
 
     summary = {"strong": [], "weak": []}
+    candidates = []
     for coin, d in data.items():
         if len(d["c4"]) < 210 or len(d["c1"]) < 210 or len(d["c15"]) < 40:
             continue
@@ -529,6 +532,9 @@ def main():
                 continue
             if side == "short" and rs_tag == "strong":
                 continue
+            if mode == "M15" and not ((side == "long" and rs_tag == "strong") or
+                                      (side == "short" and rs_tag == "weak")):
+                continue          # 15m — только самые сильные (лонг) / слабые (шорт)
 
             levels = lv_h1 if mode == "H1" else lv_m15
             zone_type = "support" if side == "long" else "resistance"
@@ -548,10 +554,37 @@ def main():
                     continue
                 o, why = plan(coin, side, ce, cc, levels, L, atr_pct(cc), settings, risk_mult, m["stop_bars"])
                 if o:
-                    send_tg(order_msg(coin, side, mode, o, patt, rs_tag, risk_mult))
+                    score = (100 if mode == "H1" else 0) + min(o["rr"], 5) * 10 + (5 if rs_tag in ("strong", "weak") else 0)
+                    candidates.append((score, coin, side, mode, o, patt, rs_tag, risk_mult))
                 else:
                     print(f"skip {coin} {mode} {side} @ {L}: {why}")
                 break     # одна попытка на монету/режим за свечу
+
+    # одна лучшая карточка за запуск + пауза + дневной лимит + выключатель «позиция открыта»
+    if candidates:
+        today_key = now.strftime("%Y-%m-%d")
+        day = st.setdefault("cards_day", {})
+        if today_key not in day:
+            day.clear()
+            day[today_key] = 0
+        last_card = st.get("last_card_ts", 0)
+        cooling = time.time() - last_card < COOLDOWN_H * 3600
+        if settings.get("position_open", 0) >= 1:
+            print("position_open=1 — карточки не шлём")
+        elif cooling:
+            print("пауза после прошлой карточки")
+        elif day[today_key] >= MAX_CARDS_DAY:
+            print("дневной лимит карточек")
+        else:
+            candidates.sort(key=lambda x: -x[0])
+            score, coin, side, mode, o, patt, rs_tag, risk_mult = candidates[0]
+            msg = order_msg(coin, side, mode, o, patt, rs_tag, risk_mult)
+            others = sorted({x[1] for x in candidates[1:]} - {coin})
+            if others:
+                msg += f"\n<i>Похожие сигналы ({', '.join(others)}) — пропускаем: одна позиция.</i>"
+            send_tg(msg)
+            st["last_card_ts"] = time.time()
+            day[today_key] += 1
 
     # статус раз в день (и при ручном запуске)
     today = now.strftime("%Y-%m-%d")
