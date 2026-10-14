@@ -416,6 +416,43 @@ def order_msg(coin, side, mode, o, patt, rs_tag, risk_mult):
             f"Не исполнилась за {m['cancel']} — отмени. Стоп сверь с хвостами на Bybit. {chart(coin)}")
 
 
+# ===== КОМАНДЫ ИЗ TELEGRAM =====
+PAUSE_MAX_H = 24          # пауза сама снимается через сутки, если забыл
+
+
+def read_commands(st):
+    """Читает новые сообщения боту: /pause (или «пауза») и /go (или «старт»)."""
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return
+    try:
+        q = urllib.parse.urlencode({"offset": st.get("tg_offset", 0) + 1, "timeout": 0})
+        data = json.loads(http_get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates?{q}", tries=1))
+    except Exception as e:  # noqa
+        print("getUpdates error:", e)
+        return
+    for upd in data.get("result", []):
+        st["tg_offset"] = max(st.get("tg_offset", 0), upd["update_id"])
+        msg = upd.get("message") or {}
+        if str(msg.get("chat", {}).get("id")) != str(TG_CHAT_ID):
+            continue
+        text = (msg.get("text") or "").strip().lower()
+        if text in ("/pause", "пауза", "/стоп"):
+            st["paused_ts"] = time.time()
+            send_tg("⏸ Пауза: новые входы не присылаю. Закрыл сделку — напиши /go")
+        elif text in ("/go", "старт", "/start"):
+            st.pop("paused_ts", None)
+            send_tg("▶️ Снова присылаю входы.")
+
+
+def is_paused(st):
+    ts = st.get("paused_ts")
+    if ts and time.time() - ts > PAUSE_MAX_H * 3600:
+        st.pop("paused_ts", None)
+        send_tg("▶️ Пауза снята автоматически (прошли сутки).")
+        return False
+    return bool(ts)
+
+
 # ===== СОСТОЯНИЕ =====
 def load_state():
     try:
@@ -439,6 +476,7 @@ def main():
     for old in ("last_1h", "last_4h"):
         st.pop(old, None)
 
+    read_commands(st)
     manual_levels, settings = load_levels()
     news = load_news()
 
@@ -569,8 +607,8 @@ def main():
             day[today_key] = 0
         last_card = st.get("last_card_ts", 0)
         cooling = time.time() - last_card < COOLDOWN_H * 3600
-        if settings.get("position_open", 0) >= 1:
-            print("position_open=1 — карточки не шлём")
+        if settings.get("position_open", 0) >= 1 or is_paused(st):
+            print("пауза — карточки не шлём")
         elif cooling:
             print("пауза после прошлой карточки")
         elif day[today_key] >= MAX_CARDS_DAY:
@@ -602,6 +640,7 @@ def main():
                 f"🥀 Слабее BTC: {', '.join(summary['weak']) or '—'}\n"
                 f"📰 Новости 36 ч: {news_txt}\n"
                 f"Риск ${settings['risk_usd']:.2f} · депозит ${settings['deposit']:.0f}"
+                + ("\n⏸ Пауза включена (/go — снять)" if st.get("paused_ts") else "")
                 + (f"\n⚠️ Нет данных: {', '.join(failed)}" if failed else ""))
         if not MANUAL:
             st["status_date"] = today
