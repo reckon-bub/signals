@@ -32,6 +32,11 @@ MODES = {
     "M15": {"ctx": "c1", "entry": "c15", "risk": 0.5, "label": "15m", "cancel": "1 ч",
             "stop_bars": 32},
 }
+# 16.10: 15m выключен — 3 шорта подряд (BNB, ETH, XRP) против свежего импульса вверх на 1H.
+# Включить обратно: M15_ON = True
+M15_ON = False
+if not M15_ON:
+    MODES.pop("M15")
 
 RS_SHORT_BARS = 42        # сила vs BTC: 7 дней (42 свечи 4H)
 RS_LONG_BARS = 180        # и 30 дней
@@ -352,7 +357,10 @@ def chart(coin):
 
 
 # ===== РАСЧЁТ ОРДЕРА =====
-def plan(coin, side, ce, cc, levels, L, ctx_atr_pct, settings, risk_mult, stop_bars):
+GUARD_ATR = 2.0   # 15m: сколько ATR 1H над/под входом проверять на препятствия для стопа
+
+
+def plan(coin, side, ce, cc, levels, L, ctx_atr_pct, settings, risk_mult, stop_bars, guard=False):
     """Возвращает (ордер, None) или (None, причина отказа)."""
     price_now = ce[-1]["c"]
     gap_max = price_now * ctx_atr_pct / 100 * 0.5
@@ -365,6 +373,23 @@ def plan(coin, side, ce, cc, levels, L, ctx_atr_pct, settings, risk_mult, stop_b
         highs = [x["h"] for x in recent if x["h"] >= L * (1 - ZONE_PCT)] + [x["h"] for x in ce[-6:]]
         stop = max(highs) * (1 + STOP_BUFFER)
     min_d = entry * ctx_atr_pct / 100 * 0.5
+    if guard:
+        # 15m: стоп за ближайшим препятствием 1H (хай/лой 12 ч, уровни, EMA 50/200 1H) в пределах 2 ATR 1H
+        win = entry * ctx_atr_pct / 100 * GUARD_ATR
+        closes = [x["c"] for x in cc]
+        emas = [e for e in (ema(closes, 50)[-1], ema(closes, 200)[-1]) if e]
+        if side == "long":
+            obs = [min(x["l"] for x in cc[-12:])] + emas + \
+                  [x["price"] for x in levels if x["type"] in ("support", "break_down")]
+            obs = [v for v in obs if entry - win <= v < entry]
+            if obs:
+                stop = min(stop, min(obs) * (1 - STOP_BUFFER))
+        else:
+            obs = [max(x["h"] for x in cc[-12:])] + emas + \
+                  [x["price"] for x in levels if x["type"] in ("resistance", "break_up")]
+            obs = [v for v in obs if entry < v <= entry + win]
+            if obs:
+                stop = max(stop, max(obs) * (1 + STOP_BUFFER))
     if side == "long":
         stop = min(stop, entry - min_d)
         swing = max(x["h"] for x in cc[-48:])          # последний хай контекста — первое препятствие
@@ -590,7 +615,8 @@ def main():
                     patt = bear_pattern(p, c) if c["c"] <= L * (1 + ZONE_PCT) else None
                 if not patt:
                     continue
-                o, why = plan(coin, side, ce, cc, levels, L, atr_pct(cc), settings, risk_mult, m["stop_bars"])
+                o, why = plan(coin, side, ce, cc, levels, L, atr_pct(cc), settings, risk_mult, m["stop_bars"],
+                                guard=(mode == "M15"))
                 if o:
                     score = (100 if mode == "H1" else 0) + min(o["rr"], 5) * 10 + (5 if rs_tag in ("strong", "weak") else 0)
                     candidates.append((score, coin, side, mode, o, patt, rs_tag, risk_mult))
