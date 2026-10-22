@@ -21,9 +21,22 @@ from datetime import datetime, timedelta, timezone
 
 # ===== НАСТРОЙКИ =====
 COINS = ["BTC", "ETH", "SOL", "LINK", "BNB", "XRP",
-         "ADA", "AVAX", "DOT", "LTC", "BCH", "NEAR", "SUI", "ATOM"]
-# Новые монеты — риск 0,5R до 26.10.2026. Потом убрать отсюда.
-HALF_RISK = {"ADA", "AVAX", "DOT", "LTC", "BCH", "NEAR", "SUI", "ATOM"}
+         "ADA", "AVAX", "DOT", "LTC", "BCH", "NEAR", "SUI", "ATOM",
+         "DOGE", "AAVE", "UNI", "APT"]
+# Новые монеты — риск 0,5R до указанной даты (включительно), потом сам переходит на 1R.
+HALF_RISK_UNTIL = {**{c: "2026-10-26" for c in ("ADA", "AVAX", "DOT", "LTC", "BCH", "NEAR", "SUI", "ATOM")},
+                   **{c: "2026-11-05" for c in ("DOGE", "AAVE", "UNI", "APT")}}
+
+
+def half_risk(coin):
+    d = HALF_RISK_UNTIL.get(coin)
+    return bool(d) and datetime.now(timezone(timedelta(hours=7))).strftime("%Y-%m-%d") <= d
+
+
+# Ретест пробоя 4H (с 22.10.2026)
+RT_MODE = {"label": "ретест 4H", "cancel": "12 ч", "risk": 1.0}
+RT_STOP_ATR = 0.6         # стоп за уровнем на 0,6 ATR(14) 4H
+RT_ENTRY_PAD = 0.001      # лимитка на 0,1% над/под уровнем, чтобы исполнилась на касании
 
 MODES = {
     # ctx — таймфрейм контекста, entry — таймфрейм входа
@@ -71,9 +84,11 @@ MANUAL = os.environ.get("MANUAL", "false").lower() == "true"
 
 # Шаг цены и количества на Bybit (USDT Perpetual). Если ордер не принимается — сверь в карточке контракта.
 PRICE_DEC = {"BTC": 1, "ETH": 2, "SOL": 2, "LINK": 3, "BNB": 2, "XRP": 4,
-             "ADA": 4, "AVAX": 3, "DOT": 3, "LTC": 2, "BCH": 2, "NEAR": 3, "SUI": 4, "ATOM": 3}
+             "ADA": 4, "AVAX": 3, "DOT": 3, "LTC": 2, "BCH": 2, "NEAR": 3, "SUI": 4, "ATOM": 3,
+             "DOGE": 5, "AAVE": 2, "UNI": 3, "APT": 4}
 QTY_STEP = {"BTC": 0.001, "ETH": 0.01, "SOL": 0.1, "LINK": 0.1, "BNB": 0.01, "XRP": 1,
-            "ADA": 1, "AVAX": 0.1, "DOT": 0.1, "LTC": 0.1, "BCH": 0.01, "NEAR": 0.1, "SUI": 10, "ATOM": 0.1}
+            "ADA": 1, "AVAX": 0.1, "DOT": 0.1, "LTC": 0.1, "BCH": 0.01, "NEAR": 0.1, "SUI": 10, "ATOM": 0.1,
+            "DOGE": 1, "AAVE": 0.01, "UNI": 0.1, "APT": 0.01}
 
 
 # ===== СЕТЬ =====
@@ -390,13 +405,7 @@ def plan(coin, side, ce, cc, levels, L, ctx_atr_pct, settings, risk_mult, stop_b
             obs = [v for v in obs if entry < v <= entry + win]
             if obs:
                 stop = max(stop, max(obs) * (1 + STOP_BUFFER))
-    extra = []
-    if obs1h:
-        # 1H: препятствия на самом 1H — EMA 50/200, автоуровни 1H, хай/лой последних 24 ч
-        closes1 = [x["c"] for x in ce]
-        extra = [e for e in (ema(closes1, 50)[-1], ema(closes1, 200)[-1]) if e]
-        extra += [x["price"] for x in auto_levels(ce, AUTO_LOOKBACK["c1"])[0]]
-        extra.append(max(x["h"] for x in ce[-24:]) if side == "long" else min(x["l"] for x in ce[-24:]))
+    extra = obstacles_1h(ce, side) if obs1h else []
     if side == "long":
         stop = min(stop, entry - min_d)
         swing = max(x["h"] for x in cc[-48:])          # последний хай контекста — первое препятствие
@@ -409,8 +418,23 @@ def plan(coin, side, ce, cc, levels, L, ctx_atr_pct, settings, risk_mult, stop_b
         targets = [t for t in targets if t < entry * 0.997]
     if not targets:
         return None, "нет цели"
-    target = targets[0]
+    return size_order(coin, side, entry, stop, targets[0], settings, risk_mult, price_now)
+
+
+def obstacles_1h(c1, side):
+    """Препятствия на 1H: EMA 50/200, автоуровни 1H, хай/лой последних 24 ч."""
+    closes1 = [x["c"] for x in c1]
+    out = [e for e in (ema(closes1, 50)[-1], ema(closes1, 200)[-1]) if e]
+    out += [x["price"] for x in auto_levels(c1, AUTO_LOOKBACK["c1"])[0]]
+    out.append(max(x["h"] for x in c1[-24:]) if side == "long" else min(x["l"] for x in c1[-24:]))
+    return out
+
+
+def size_order(coin, side, entry, stop, target, settings, risk_mult, price_now):
+    """R:R, размер, плечо, ликвидация. Возвращает (ордер, None) или (None, причина)."""
     dist = abs(entry - stop)
+    if dist <= 0:
+        return None, "стоп = вход"
     rr = (abs(target - entry) - 0.1 * dist) / dist   # с комиссией ~0,1R
     if rr < MIN_RR:
         return None, f"R:R {rr:.1f}"
@@ -433,10 +457,38 @@ def plan(coin, side, ce, cc, levels, L, ctx_atr_pct, settings, risk_mult, stop_b
             "risk": qty * dist, "rr": rr, "price_now": price_now, "chased": entry != price_now}, None
 
 
+def retest_plan(coin, side, L, c4, c1, levels, settings, risk_mult):
+    """Ретест пробитого горизонтального уровня 4H: лимитка у уровня, стоп за уровнем на 0,6 ATR 4H."""
+    price_now = c1[-1]["c"]
+    a4 = (atr_pct(c4) or 0) * L / 100
+    if a4 <= 0:
+        return None, "нет ATR"
+    obs = [x["price"] for x in levels] + obstacles_1h(c1, side)
+    if side == "long":
+        entry = L * (1 + RT_ENTRY_PAD)
+        stop = L - RT_STOP_ATR * a4
+        if price_now <= entry:
+            return None, "цена уже у уровня/под ним"
+        obs.append(max(x["h"] for x in c4[-6:]))          # хай пробойного движения
+        targets = sorted(t for t in obs if t > entry * 1.003)
+    else:
+        entry = L * (1 - RT_ENTRY_PAD)
+        stop = L + RT_STOP_ATR * a4
+        if price_now >= entry:
+            return None, "цена уже у уровня/над ним"
+        obs.append(min(x["l"] for x in c4[-6:]))
+        targets = sorted((t for t in obs if t < entry * 0.997), reverse=True)
+    if not targets:
+        return None, "нет цели"
+    return size_order(coin, side, entry, stop, targets[0], settings, risk_mult, price_now)
+
+
 def order_msg(coin, side, mode, o, patt, rs_tag, risk_mult):
-    m = MODES[mode]
+    m = MODES.get(mode) or RT_MODE
     side_txt = "ЛОНГ 🟩" if side == "long" else "ШОРТ 🟥"
     why = "Откат к поддержке" if side == "long" else "Откат к сопротивлению"
+    if mode == "RT":
+        why = "Ретест пробитого уровня"
     strength = {"strong": ", сильнее BTC", "weak": ", слабее BTC"}.get(rs_tag, "")
     risk_txt = f"${o['risk']:.2f}" + (" (0,5R)" if risk_mult < 1 else "")
     wait = f"\nЦена сейчас {px(coin, o['price_now'])} — ждём отката к лимитке." if o["chased"] else ""
@@ -445,7 +497,9 @@ def order_msg(coin, side, mode, o, patt, rs_tag, risk_mult):
             f"тейк <code>{px(coin, o['target'])}</code>\n"
             f"<code>{o['qty']}</code> {coin} · {o['lev']}x · риск {risk_txt} · R:R {o['rr']:.1f}\n"
             f"{why}, {patt}{strength}.{wait}\n"
-            f"Не исполнилась за {m['cancel']} — отмени. Стоп сверь с хвостами на Bybit. {chart(coin)}")
+            f"Не исполнилась за {m['cancel']} — отмени."
+            + (" Закрытие 4H обратно за уровень до входа — тоже отмени." if mode == "RT" else "")
+            + f" Стоп сверь с хвостами на Bybit. {chart(coin)}")
 
 
 # ===== КОМАНДЫ ИЗ TELEGRAM =====
@@ -578,9 +632,26 @@ def main():
             ev, held = breakout_state(d["c4"], x["price"], up)
             if held:
                 retests.append({"price": x["price"], "type": "support" if up else "resistance"})
-            if new_4h and ev == "confirmed" and ((up and tr4 == "long") or (not up and tr4 == "short")):
-                send_tg(f"✅ <b>{coin}</b>: пробой {fmt(x['price'])} {'вверх' if up else 'вниз'} подтверждён. "
-                        f"Ждём ретест — вход пришлю отдельно. {chart(coin)}")
+            if not (new_4h and ev == "confirmed"):
+                continue
+            side_rt = "long" if up else "short"
+            # не против тренда 4H, BTC-фильтр и сила vs BTC, новости, ATR
+            if (up and tr4 == "short") or (not up and tr4 == "long"):
+                continue
+            if blackout or (atr4 or 99) > ATR_MAX:
+                continue
+            if up and (rs_tag == "weak" or (coin != "BTC" and btc_ok is False)):
+                continue
+            if not up and rs_tag == "strong":
+                continue
+            rm = RT_MODE["risk"] * (0.5 if half_risk(coin) else 1)
+            o, why = retest_plan(coin, side_rt, x["price"], d["c4"], d["c1"], lv_h1, settings, rm)
+            if o:
+                score = 100 + min(o["rr"], 5) * 10 + (5 if rs_tag in ("strong", "weak") else 0)
+                candidates.append((score, coin, side_rt, "RT", o,
+                                   f"пробой {px(coin, x['price'])} подтверждён 2 свечами 4H", rs_tag, rm))
+            else:
+                print(f"skip {coin} RT {side_rt} @ {x['price']}: {why}")
         seen[k4] = d["c4"][-1]["t"]
 
         for mode, m in MODES.items():
@@ -612,7 +683,7 @@ def main():
             if e50_ctx:
                 zones.append(e50_ctx)
             p, c = ce[-2], ce[-1]
-            risk_mult = m["risk"] * (0.5 if coin in HALF_RISK and m["risk"] >= 1 else 1)
+            risk_mult = m["risk"] * (0.5 if half_risk(coin) and m["risk"] >= 1 else 1)
             for L in sorted(set(zones), key=lambda z: abs(z - c["c"])):
                 if not (touched(c, L) or touched(p, L)):
                     continue
