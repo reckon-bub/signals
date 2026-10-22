@@ -360,7 +360,7 @@ def chart(coin):
 GUARD_ATR = 2.0   # 15m: сколько ATR 1H над/под входом проверять на препятствия для стопа
 
 
-def plan(coin, side, ce, cc, levels, L, ctx_atr_pct, settings, risk_mult, stop_bars, guard=False):
+def plan(coin, side, ce, cc, levels, L, ctx_atr_pct, settings, risk_mult, stop_bars, guard=False, obs1h=False):
     """Возвращает (ордер, None) или (None, причина отказа)."""
     price_now = ce[-1]["c"]
     gap_max = price_now * ctx_atr_pct / 100 * 0.5
@@ -390,15 +390,22 @@ def plan(coin, side, ce, cc, levels, L, ctx_atr_pct, settings, risk_mult, stop_b
             obs = [v for v in obs if entry < v <= entry + win]
             if obs:
                 stop = max(stop, max(obs) * (1 + STOP_BUFFER))
+    extra = []
+    if obs1h:
+        # 1H: препятствия на самом 1H — EMA 50/200, автоуровни 1H, хай/лой последних 24 ч
+        closes1 = [x["c"] for x in ce]
+        extra = [e for e in (ema(closes1, 50)[-1], ema(closes1, 200)[-1]) if e]
+        extra += [x["price"] for x in auto_levels(ce, AUTO_LOOKBACK["c1"])[0]]
+        extra.append(max(x["h"] for x in ce[-24:]) if side == "long" else min(x["l"] for x in ce[-24:]))
     if side == "long":
         stop = min(stop, entry - min_d)
         swing = max(x["h"] for x in cc[-48:])          # последний хай контекста — первое препятствие
-        targets = sorted([x["price"] for x in levels] + [swing])
+        targets = sorted([x["price"] for x in levels] + [swing] + extra)
         targets = [t for t in targets if t > entry * 1.003]
     else:
         stop = max(stop, entry + min_d)
         swing = min(x["l"] for x in cc[-48:])
-        targets = sorted([x["price"] for x in levels] + [swing], reverse=True)
+        targets = sorted([x["price"] for x in levels] + [swing] + extra, reverse=True)
         targets = [t for t in targets if t < entry * 0.997]
     if not targets:
         return None, "нет цели"
@@ -616,7 +623,7 @@ def main():
                 if not patt:
                     continue
                 o, why = plan(coin, side, ce, cc, levels, L, atr_pct(cc), settings, risk_mult, m["stop_bars"],
-                                guard=(mode == "M15"))
+                                guard=(mode == "M15"), obs1h=(mode == "H1"))
                 if o:
                     score = (100 if mode == "H1" else 0) + min(o["rr"], 5) * 10 + (5 if rs_tag in ("strong", "weak") else 0)
                     candidates.append((score, coin, side, mode, o, patt, rs_tag, risk_mult))
