@@ -554,6 +554,14 @@ def save_state(st):
 
 
 # ===== ОСНОВНОЙ ЦИКЛ =====
+def stats_txt(s):
+    """Сводка фильтров с прошлого статуса — видно, почему нет карточек."""
+    g = lambda k: s.get(k, 0)
+    return (f"📊 С прошлого статуса: проверок 1H {g('checks')} · тренд 4H неясен {g('flat')} · "
+            f"отсеяно фильтрами (BTC/сила/ATR/новости) {g('filt')} · сетапов у уровня {g('setup')} · "
+            f"ретестов 4H {g('rt')} → R:R<2 {g('rr')}, прочее {g('other')}, годных {g('ok')}, отправлено {g('sent')}")
+
+
 def main():
     now = datetime.now(VN)
     st = load_state()
@@ -608,6 +616,10 @@ def main():
 
     summary = {"strong": [], "weak": []}
     candidates = []
+    stats = st.setdefault("stats", {})
+
+    def bump(k):
+        stats[k] = stats.get(k, 0) + 1
     for coin, d in data.items():
         if len(d["c4"]) < 210 or len(d["c1"]) < 210 or len(d["c15"]) < 40:
             continue
@@ -646,6 +658,8 @@ def main():
                 continue
             rm = RT_MODE["risk"] * (0.5 if half_risk(coin) else 1)
             o, why = retest_plan(coin, side_rt, x["price"], d["c4"], d["c1"], lv_h1, settings, rm)
+            bump("rt")
+            bump("ok" if o else ("rr" if why.startswith("R:R") else "other"))
             if o:
                 score = 100 + min(o["rr"], 5) * 10 + (5 if rs_tag in ("strong", "weak") else 0)
                 candidates.append((score, coin, side_rt, "RT", o,
@@ -660,18 +674,23 @@ def main():
             if ce[-1]["t"] <= seen.get(key, 0):
                 continue
             seen[key] = ce[-1]["t"]
+            bump("checks")
 
             tr_ctx, e50_ctx = trend(cc)
             if tr_ctx not in ("long", "short"):
+                bump("flat")
                 continue
             if mode == "M15" and tr4 in ("long", "short") and tr4 != tr_ctx:
                 continue          # 15m не торгуем против 4H
             side = tr_ctx
             if blackout or (atr4 or 99) > ATR_MAX:
+                bump("filt")
                 continue
             if side == "long" and (rs_tag == "weak" or (coin != "BTC" and btc_ok is False)):
+                bump("filt")
                 continue
             if side == "short" and rs_tag == "strong":
+                bump("filt")
                 continue
             if mode == "M15" and not ((side == "long" and rs_tag == "strong") or
                                       (side == "short" and rs_tag == "weak")):
@@ -695,6 +714,8 @@ def main():
                     continue
                 o, why = plan(coin, side, ce, cc, levels, L, atr_pct(cc), settings, risk_mult, m["stop_bars"],
                                 guard=(mode == "M15"), obs1h=(mode == "H1"))
+                bump("setup")
+                bump("ok" if o else ("rr" if why.startswith("R:R") else "other"))
                 if o:
                     score = (100 if mode == "H1" else 0) + min(o["rr"], 5) * 10 + (5 if rs_tag in ("strong", "weak") else 0)
                     candidates.append((score, coin, side, mode, o, patt, rs_tag, risk_mult))
@@ -725,6 +746,7 @@ def main():
             if others:
                 msg += f"\n<i>Похожие сигналы ({', '.join(others)}) — пропускаем: одна позиция.</i>"
             send_tg(msg)
+            bump("sent")
             st["last_card_ts"] = time.time()
             day[today_key] += 1
 
@@ -745,9 +767,11 @@ def main():
                 f"📰 Новости 36 ч: {news_txt}\n"
                 f"Риск ${settings['risk_usd']:.2f} · депозит ${settings['deposit']:.0f}"
                 + ("\n⏸ Пауза включена (/go — снять)" if st.get("paused_ts") else "")
-                + (f"\n⚠️ Нет данных: {', '.join(failed)}" if failed else ""))
+                + (f"\n⚠️ Нет данных: {', '.join(failed)}" if failed else "")
+                + "\n" + stats_txt(stats))
         if not MANUAL:
             st["status_date"] = today
+            st["stats"] = {}
 
     save_state(st)
 
