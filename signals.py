@@ -41,7 +41,7 @@ RT_ENTRY_PAD = 0.001      # лимитка на 0,1% над/под уровне�
 MODES = {
     # ctx — таймфрейм контекста, entry — таймфрейм входа
     "H1":  {"ctx": "c4", "entry": "c1",  "risk": 1.0, "label": "1H",  "cancel": "2 ч",
-            "stop_bars": 24},
+            "stop_bars": 48},   # стоп за хвостами зоны за 2 суток (было 24 — LINK 28.10 хвост 11,60 остался за окном)
     "M15": {"ctx": "c1", "entry": "c15", "risk": 0.5, "label": "15m", "cancel": "1 ч",
             "stop_bars": 32},
 }
@@ -251,6 +251,25 @@ def trend(c):
 # ===== ПАТТЕРНЫ =====
 def touched(c, L):
     return c["l"] <= L * (1 + ZONE_PCT) and c["h"] >= L * (1 - ZONE_PCT)
+
+
+def structure_against(c, side, k=AUTO_PIVOT, n=3):
+    """True, если структура 1H против сделки: для шорта последние n свинг-лоёв растут,
+    для лонга последние n свинг-хаёв падают (ATOM 26.10, LINK 28.10)."""
+    data = c[-120:]
+    pts = []
+    for i in range(k, len(data) - k):
+        win = data[i - k:i + k + 1]
+        if side == "short" and data[i]["l"] == min(x["l"] for x in win):
+            pts.append(data[i]["l"])
+        if side == "long" and data[i]["h"] == max(x["h"] for x in win):
+            pts.append(data[i]["h"])
+    pts = pts[-n:]
+    if len(pts) < n:
+        return False
+    if side == "short":
+        return all(pts[i] < pts[i + 1] for i in range(n - 1))
+    return all(pts[i] > pts[i + 1] for i in range(n - 1))
 
 
 def bull_pattern(p, c):
@@ -558,7 +577,7 @@ def stats_txt(s):
     """Сводка фильтров с прошлого статуса — видно, почему нет карточек."""
     g = lambda k: s.get(k, 0)
     return (f"📊 С прошлого статуса: проверок 1H {g('checks')} · тренд 4H неясен {g('flat')} · "
-            f"отсеяно фильтрами (BTC/сила/ATR/новости) {g('filt')} · сетапов у уровня {g('setup')} · "
+            f"отсеяно фильтрами (BTC/сила/ATR/новости) {g('filt')} · структура 1H против {g('struct')} · сетапов у уровня {g('setup')} · "
             f"ретестов 4H {g('rt')} → R:R<2 {g('rr')}, прочее {g('other')}, годных {g('ok')}, отправлено {g('sent')}")
 
 
@@ -697,6 +716,9 @@ def main():
                 continue          # 15m — только самые сильные (лонг) / слабые (шорт)
 
             levels = lv_h1 if mode == "H1" else lv_m15
+            if mode == "H1" and structure_against(ce, side):
+                bump("struct")
+                continue      # шорт при растущих лоях 1H / лонг при падающих хаях 1H — не торгуем
             zone_type = "support" if side == "long" else "resistance"
             zones = [x["price"] for x in levels + retests if x["type"] == zone_type]
             if e50_ctx:
