@@ -428,24 +428,36 @@ def plan(coin, side, ce, cc, levels, L, ctx_atr_pct, settings, risk_mult, stop_b
     if side == "long":
         stop = min(stop, entry - min_d)
         swing = max(x["h"] for x in cc[-48:])          # последний хай контекста — первое препятствие
-        targets = sorted([x["price"] for x in levels] + [swing] + extra)
-        targets = [t for t in targets if t > entry * 1.003]
     else:
         stop = max(stop, entry + min_d)
         swing = min(x["l"] for x in cc[-48:])
-        targets = sorted([x["price"] for x in levels] + [swing] + extra, reverse=True)
-        targets = [t for t in targets if t < entry * 0.997]
-    if not targets:
+    cands = [(x["price"], "lvl4h") for x in levels] + [(swing, "sw4h")] + extra
+    return pick_target(coin, side, entry, stop, cands, settings, risk_mult, price_now)
+
+
+def pick_target(coin, side, entry, stop, cands, settings, risk_mult, price_now):
+    """Ближайшее препятствие по ходу сделки → размер. При R:R<2 в причине указан источник цели."""
+    if side == "long":
+        cands = sorted(c for c in cands if c[0] > entry * 1.003)
+    else:
+        cands = sorted((c for c in cands if c[0] < entry * 0.997), reverse=True)
+    if not cands:
         return None, "нет цели"
-    return size_order(coin, side, entry, stop, targets[0], settings, risk_mult, price_now)
+    target, src = cands[0]
+    o, why = size_order(coin, side, entry, stop, target, settings, risk_mult, price_now)
+    if why and why.startswith("R:R"):
+        why += "|" + src
+    return o, why
 
 
 def obstacles_1h(c1, side):
-    """Препятствия на 1H: EMA 50/200, автоуровни 1H, хай/лой последних 24 ч."""
+    """Препятствия на 1H: EMA200 1H, автоуровни 1H (2+ касания), хай/лой последних 24 ч.
+    30.10: EMA50 1H убрана — это сама зона отката, цена её обычно проходит; резала все сетапы (11 из 11)."""
     closes1 = [x["c"] for x in c1]
-    out = [e for e in (ema(closes1, 50)[-1], ema(closes1, 200)[-1]) if e]
-    out += [x["price"] for x in auto_levels(c1, AUTO_LOOKBACK["c1"])[0]]
-    out.append(max(x["h"] for x in c1[-24:]) if side == "long" else min(x["l"] for x in c1[-24:]))
+    e200 = ema(closes1, 200)[-1]
+    out = [(e200, "ema200")] if e200 else []
+    out += [(x["price"], "lvl1h") for x in auto_levels(c1, AUTO_LOOKBACK["c1"])[0]]
+    out.append((max(x["h"] for x in c1[-24:]) if side == "long" else min(x["l"] for x in c1[-24:]), "sw24h"))
     return out
 
 
@@ -482,24 +494,20 @@ def retest_plan(coin, side, L, c4, c1, levels, settings, risk_mult):
     a4 = (atr_pct(c4) or 0) * L / 100
     if a4 <= 0:
         return None, "нет ATR"
-    obs = [x["price"] for x in levels] + obstacles_1h(c1, side)
+    obs = [(x["price"], "lvl4h") for x in levels] + obstacles_1h(c1, side)
     if side == "long":
         entry = L * (1 + RT_ENTRY_PAD)
         stop = L - RT_STOP_ATR * a4
         if price_now <= entry:
             return None, "цена уже у уровня/под ним"
-        obs.append(max(x["h"] for x in c4[-6:]))          # хай пробойного движения
-        targets = sorted(t for t in obs if t > entry * 1.003)
+        obs.append((max(x["h"] for x in c4[-6:]), "sw4h"))          # хай пробойного движения
     else:
         entry = L * (1 - RT_ENTRY_PAD)
         stop = L + RT_STOP_ATR * a4
         if price_now >= entry:
             return None, "цена уже у уровня/над ним"
-        obs.append(min(x["l"] for x in c4[-6:]))
-        targets = sorted((t for t in obs if t < entry * 0.997), reverse=True)
-    if not targets:
-        return None, "нет цели"
-    return size_order(coin, side, entry, stop, targets[0], settings, risk_mult, price_now)
+        obs.append((min(x["l"] for x in c4[-6:]), "sw4h"))
+    return pick_target(coin, side, entry, stop, obs, settings, risk_mult, price_now)
 
 
 def order_msg(coin, side, mode, o, patt, rs_tag, risk_mult):
@@ -578,7 +586,9 @@ def stats_txt(s):
     g = lambda k: s.get(k, 0)
     return (f"📊 С прошлого статуса: проверок 1H {g('checks')} · тренд 4H неясен {g('flat')} · "
             f"отсеяно фильтрами (BTC/сила/ATR/новости) {g('filt')} · структура 1H против {g('struct')} · сетапов у уровня {g('setup')} · "
-            f"ретестов 4H {g('rt')} → R:R<2 {g('rr')}, прочее {g('other')}, годных {g('ok')}, отправлено {g('sent')}")
+            f"ретестов 4H {g('rt')} → R:R<2 {g('rr')} (упор в: уровень 4H {g('rr_lvl4h')}, свинг 4H {g('rr_sw4h')}, "
+            f"EMA200 1H {g('rr_ema200')}, уровень 1H {g('rr_lvl1h')}, хай/лой 24ч {g('rr_sw24h')}), "
+            f"прочее {g('other')}, годных {g('ok')}, отправлено {g('sent')}")
 
 
 def main():
@@ -679,6 +689,8 @@ def main():
             o, why = retest_plan(coin, side_rt, x["price"], d["c4"], d["c1"], lv_h1, settings, rm)
             bump("rt")
             bump("ok" if o else ("rr" if why.startswith("R:R") else "other"))
+            if not o and "|" in why:
+                bump("rr_" + why.split("|")[1])
             if o:
                 score = 100 + min(o["rr"], 5) * 10 + (5 if rs_tag in ("strong", "weak") else 0)
                 candidates.append((score, coin, side_rt, "RT", o,
@@ -738,6 +750,8 @@ def main():
                                 guard=(mode == "M15"), obs1h=(mode == "H1"))
                 bump("setup")
                 bump("ok" if o else ("rr" if why.startswith("R:R") else "other"))
+                if not o and "|" in why:
+                    bump("rr_" + why.split("|")[1])
                 if o:
                     score = (100 if mode == "H1" else 0) + min(o["rr"], 5) * 10 + (5 if rs_tag in ("strong", "weak") else 0)
                     candidates.append((score, coin, side, mode, o, patt, rs_tag, risk_mult))
