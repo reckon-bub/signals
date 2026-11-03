@@ -71,6 +71,7 @@ AUTO_CLUSTER = 0.006      # свинги ближе 0,6% = один уровен
 AUTO_MAX_DIST = 0.12      # уровни не дальше 12% от цены
 AUTO_PER_SIDE = 2
 AUTO_LOOKBACK = {"c4": 180, "c1": 168}   # 4H ~30 дней, 1H ~7 дней
+OBS_1H_TOUCH = 3          # уровень 1H считается препятствием для цели только при 3+ касаниях
 
 VN = timezone(timedelta(hours=7))
 API = "https://data-api.binance.vision/api/v3/klines"
@@ -318,7 +319,7 @@ def breakout_state(c, L, up):
 
 
 # ===== АВТОУРОВНИ =====
-def auto_levels(c, lookback):
+def auto_levels(c, lookback, min_touch=2):
     """Свинги -> кластеры (2+ касания) -> ближайшие поддержки/сопротивления. Возвращает (уровни, последний свинг-лоу)."""
     data = c[-lookback:]
     if len(data) < 2 * AUTO_PIVOT + 2:
@@ -349,7 +350,7 @@ def auto_levels(c, lookback):
         else:
             cand = sorted([x for x in clusters if price * 1.001 < x["mean"] < price * (1 + AUTO_MAX_DIST)],
                           key=lambda x: x["mean"])
-        strong = [x for x in cand if len(x["pts"]) >= 2][:AUTO_PER_SIDE]
+        strong = [x for x in cand if len(x["pts"]) >= min_touch][:AUTO_PER_SIDE]
         for x in strong:
             out.append({"price": round(x["mean"], 8), "type": side, "auto": True})
         if strong:
@@ -456,7 +457,9 @@ def obstacles_1h(c1, side):
     closes1 = [x["c"] for x in c1]
     e200 = ema(closes1, 200)[-1]
     out = [(e200, "ema200")] if e200 else []
-    out += [(x["price"], "lvl1h") for x in auto_levels(c1, AUTO_LOOKBACK["c1"])[0]]
+    # 02.11: уровни 1H — только с 3+ касаниями (с 2 касаниями резали 5 из 6 сетапов)
+    out += [(x["price"], "lvl1h") for x in auto_levels(c1, AUTO_LOOKBACK["c1"], min_touch=OBS_1H_TOUCH)[0]
+            if x["type"] in ("support", "resistance")]
     out.append((max(x["h"] for x in c1[-24:]) if side == "long" else min(x["l"] for x in c1[-24:]), "sw24h"))
     return out
 
