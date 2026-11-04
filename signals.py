@@ -254,6 +254,27 @@ def touched(c, L):
     return c["l"] <= L * (1 + ZONE_PCT) and c["h"] >= L * (1 - ZONE_PCT)
 
 
+IMPULSE_BARS = 6         # окно для фильтра «рывок против сделки», свечей 1H
+IMPULSE_ATR = 3.0        # рывок больше 3 ATR(14) 1H (XRP 03.11 ~6 ATR, BNB 04.11 ~5, BNB 19.10 ~6; обычный откат ~1–2)
+
+
+def impulse_against(c, side, bars=IMPULSE_BARS, mult=IMPULSE_ATR):
+    """True, если за последние bars свечей был рывок против сделки > mult ATR:
+    для шорта — рост от лоя к более позднему хаю, для лонга — падение от хая к более позднему лою
+    (XRP 03.11, BNB 04.11, BNB 19.10)."""
+    a = (atr_pct(c) or 0) * c[-1]["c"] / 100
+    if a <= 0:
+        return False
+    w = c[-bars:]
+    if side == "short":
+        i = min(range(len(w)), key=lambda j: w[j]["l"])
+        move = max(x["h"] for x in w[i:]) - w[i]["l"]
+    else:
+        i = max(range(len(w)), key=lambda j: w[j]["h"])
+        move = w[i]["h"] - min(x["l"] for x in w[i:])
+    return move > mult * a
+
+
 def structure_against(c, side, k=AUTO_PIVOT, n=3):
     """True, если структура 1H против сделки: для шорта последние n свинг-лоёв растут,
     для лонга последние n свинг-хаёв падают (ATOM 26.10, LINK 28.10)."""
@@ -588,7 +609,7 @@ def stats_txt(s):
     """Сводка фильтров с прошлого статуса — видно, почему нет карточек."""
     g = lambda k: s.get(k, 0)
     return (f"📊 С прошлого статуса: проверок 1H {g('checks')} · тренд 4H неясен {g('flat')} · "
-            f"отсеяно фильтрами (BTC/сила/ATR/новости) {g('filt')} · структура 1H против {g('struct')} · сетапов у уровня {g('setup')} · "
+            f"отсеяно фильтрами (BTC/сила/ATR/новости) {g('filt')} · структура 1H против {g('struct')} · рывок против {g('impulse')} · сетапов у уровня {g('setup')} · "
             f"ретестов 4H {g('rt')} → R:R<2 {g('rr')} (упор в: уровень 4H {g('rr_lvl4h')}, свинг 4H {g('rr_sw4h')}, "
             f"EMA200 1H {g('rr_ema200')}, уровень 1H {g('rr_lvl1h')}, хай/лой 24ч {g('rr_sw24h')}), "
             f"прочее {g('other')}, годных {g('ok')}, отправлено {g('sent')}")
@@ -733,7 +754,10 @@ def main():
             levels = lv_h1 if mode == "H1" else lv_m15
             if mode == "H1" and structure_against(ce, side):
                 bump("struct")
-                continue      # шорт при растущих лоях 1H / лонг при падающих хаях 1H — не торгуем
+                continue
+            if mode == "H1" and impulse_against(ce, side):
+                bump("impulse")
+                continue      # шорт сразу после рывка вверх / лонг после обвала — не торгуем      # шорт при растущих лоях 1H / лонг при падающих хаях 1H — не торгуем
             zone_type = "support" if side == "long" else "resistance"
             zones = [x["price"] for x in levels + retests if x["type"] == zone_type]
             if e50_ctx:
