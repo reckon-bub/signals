@@ -64,6 +64,11 @@ STOP_BUFFER = 0.001       # +0,1% за свинг
 MIN_RR = 2.0
 COOLDOWN_H = 3            # после карточки — 3 часа тишины по входам
 MAX_CARDS_DAY = 3         # не больше 3 карточек в день
+WATCH_RR = 1.5            # 🟡 «на заметку»: сетапы с R:R 1,5–2 — не сделка, а тренировка глаза
+WATCH_MAX_DAY = 4
+WATCH_COOLDOWN_H = 2
+LAST_NEAR = None
+SRC_TXT = {"lvl4h": "уровень 4H", "sw4h": "свинг 4H", "ema200": "EMA200 1H", "lvl1h": "уровень 1H", "sw24h": "хай/лой 24 ч"}
 STATUS_HOUR_VN = 7
 
 AUTO_PIVOT = 3            # свинг = экстремум среди 3 свечей слева и 3 справа
@@ -446,7 +451,8 @@ def plan(coin, side, ce, cc, levels, L, ctx_atr_pct, settings, risk_mult, stop_b
             obs = [v for v in obs if entry < v <= entry + win]
             if obs:
                 stop = max(stop, max(obs) * (1 + STOP_BUFFER))
-    extra = obstacles_1h(ce, side) if obs1h else []
+    # 06.11: в режиме 1H сделка всегда по тренду 4H → лой/хай 24 ч по ходу тренда должен быть пробит, это не цель
+    extra = obstacles_1h(ce, side, with_sw24=False) if obs1h else []
     if side == "long":
         stop = min(stop, entry - min_d)
         swing = max(x["h"] for x in cc[-48:])          # последний хай контекста — первое препятствие
@@ -467,12 +473,18 @@ def pick_target(coin, side, entry, stop, cands, settings, risk_mult, price_now):
         return None, "нет цели"
     target, src = cands[0]
     o, why = size_order(coin, side, entry, stop, target, settings, risk_mult, price_now)
+    global LAST_NEAR
+    LAST_NEAR = None
     if why and why.startswith("R:R"):
+        dist = abs(entry - stop)
+        rr = (abs(target - entry) - 0.1 * dist) / dist
+        if WATCH_RR <= rr < MIN_RR:
+            LAST_NEAR = {"entry": entry, "stop": stop, "target": target, "rr": rr, "src": src}
         why += "|" + src
     return o, why
 
 
-def obstacles_1h(c1, side):
+def obstacles_1h(c1, side, with_sw24=True):
     """Препятствия на 1H: EMA200 1H, автоуровни 1H (2+ касания), хай/лой последних 24 ч.
     30.10: EMA50 1H убрана — это сама зона отката, цена её обычно проходит; резала все сетапы (11 из 11)."""
     closes1 = [x["c"] for x in c1]
@@ -481,7 +493,8 @@ def obstacles_1h(c1, side):
     # 02.11: уровни 1H — только с 3+ касаниями (с 2 касаниями резали 5 из 6 сетапов)
     out += [(x["price"], "lvl1h") for x in auto_levels(c1, AUTO_LOOKBACK["c1"], min_touch=OBS_1H_TOUCH)[0]
             if x["type"] in ("support", "resistance")]
-    out.append((max(x["h"] for x in c1[-24:]) if side == "long" else min(x["l"] for x in c1[-24:]), "sw24h"))
+    if with_sw24:
+        out.append((max(x["h"] for x in c1[-24:]) if side == "long" else min(x["l"] for x in c1[-24:]), "sw24h"))
     return out
 
 
@@ -612,7 +625,7 @@ def stats_txt(s):
             f"отсеяно фильтрами (BTC/сила/ATR/новости) {g('filt')} · структура 1H против {g('struct')} · рывок против {g('impulse')} · сетапов у уровня {g('setup')} · "
             f"ретестов 4H {g('rt')} → R:R<2 {g('rr')} (упор в: уровень 4H {g('rr_lvl4h')}, свинг 4H {g('rr_sw4h')}, "
             f"EMA200 1H {g('rr_ema200')}, уровень 1H {g('rr_lvl1h')}, хай/лой 24ч {g('rr_sw24h')}), "
-            f"прочее {g('other')}, годных {g('ok')}, отправлено {g('sent')}")
+            f"прочее {g('other')}, годных {g('ok')}, отправлено {g('sent')}, 🟡 на заметку {g('watch')}")
 
 
 def main():
@@ -669,6 +682,7 @@ def main():
 
     summary = {"strong": [], "weak": []}
     candidates = []
+    watch = []
     stats = st.setdefault("stats", {})
 
     def bump(k):
@@ -784,6 +798,8 @@ def main():
                     candidates.append((score, coin, side, mode, o, patt, rs_tag, risk_mult))
                 else:
                     print(f"skip {coin} {mode} {side} @ {L}: {why}")
+                    if LAST_NEAR and mode == "H1":
+                        watch.append((LAST_NEAR["rr"], coin, side, patt, rs_tag, LAST_NEAR))
                 break     # одна попытка на монету/режим за свечу
 
     # одна лучшая карточка за запуск + пауза + дневной лимит + выключатель «позиция открыта»
@@ -812,6 +828,27 @@ def main():
             bump("sent")
             st["last_card_ts"] = time.time()
             day[today_key] += 1
+
+    # 🟡 «на заметку»: только если в этот запуск не было настоящей карточки, нет позиции/паузы
+    elif watch and settings.get("position_open", 0) < 1 and not is_paused(st):
+        wkey = now.strftime("%Y-%m-%d")
+        wd = st.setdefault("watch_day", {})
+        if wkey not in wd:
+            wd.clear()
+            wd[wkey] = 0
+        if wd[wkey] < WATCH_MAX_DAY and time.time() - st.get("last_watch_ts", 0) >= WATCH_COOLDOWN_H * 3600:
+            watch.sort(key=lambda x: -x[0])
+            rr, coin, side, patt, rs_tag, w = watch[0]
+            side_txt = "ЛОНГ" if side == "long" else "ШОРТ"
+            strength = {"strong": ", сильнее BTC", "weak": ", слабее BTC"}.get(rs_tag, "")
+            send_tg(f"🟡 <b>{coin} · {side_txt} · 1H — на заметку, НЕ сделка</b>\n"
+                    f"Уровень {px(coin, w['entry'])} · стоп {px(coin, w['stop'])} · "
+                    f"ближайшая цель {px(coin, w['target'])} ({SRC_TXT.get(w['src'], w['src'])}) · R:R {rr:.1f}\n"
+                    f"{'Откат к поддержке' if side == 'long' else 'Откат к сопротивлению'}, {patt}{strength}.\n"
+                    f"R:R меньше 2 — не входим. Открой график: видишь ли ты сам, что цена дойдёт дальше? {chart(coin)}")
+            bump("watch")
+            st["last_watch_ts"] = time.time()
+            wd[wkey] += 1
 
     # статус раз в день (и при ручном запуске)
     today = now.strftime("%Y-%m-%d")
