@@ -53,7 +53,8 @@ if not M15_ON:
 
 RS_SHORT_BARS = 42        # сила vs BTC: 7 дней (42 свечи 4H)
 RS_LONG_BARS = 180        # и 30 дней
-ZONE_PCT = 0.004          # зона вокруг уровня: ±0,4%
+ZONE_PCT = 0.006          # зона вокруг уровня: ±0,6% (было 0,4% до 08.11.2026)
+MERGE_PCT = 0.008         # склейка близких автоуровней (не трогаем — как было при 0,4%×2)
 ATR_MAX = 5.0             # ATR(14) 4H, % — выше монета «слишком нервная»
 NEWS_BEFORE_H = 2         # Tier 1: не входим за 2 часа до выхода
 NEWS_AFTER_MIN = 30       # и 30 минут после
@@ -389,7 +390,7 @@ def merge_levels(manual, auto):
     """Ручные уровни главнее: автоуровень ближе ±0,8% к уже добавленному того же типа — отбрасывается."""
     res = list(manual)
     for a in auto:
-        if any(abs(a["price"] - m["price"]) <= m["price"] * ZONE_PCT * 2 and a["type"] == m["type"] for m in res):
+        if any(abs(a["price"] - m["price"]) <= m["price"] * MERGE_PCT and a["type"] == m["type"] for m in res):
             continue
         res.append(a)
     return res
