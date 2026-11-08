@@ -22,10 +22,12 @@ from datetime import datetime, timedelta, timezone
 # ===== НАСТРОЙКИ =====
 COINS = ["BTC", "ETH", "SOL", "LINK", "BNB", "XRP",
          "ADA", "AVAX", "DOT", "LTC", "BCH", "NEAR", "SUI", "ATOM",
-         "DOGE", "AAVE", "UNI", "APT"]
+         "DOGE", "AAVE", "UNI", "APT",
+         "XLM", "HBAR", "TAO", "ENA", "ONDO", "QNT", "ZEC"]
 # Новые монеты — риск 0,5R до указанной даты (включительно), потом сам переходит на 1R.
 HALF_RISK_UNTIL = {**{c: "2026-10-26" for c in ("ADA", "AVAX", "DOT", "LTC", "BCH", "NEAR", "SUI", "ATOM")},
-                   **{c: "2026-11-05" for c in ("DOGE", "AAVE", "UNI", "APT")}}
+                   **{c: "2026-11-05" for c in ("DOGE", "AAVE", "UNI", "APT")},
+                   **{c: "2026-11-22" for c in ("XLM", "HBAR", "TAO", "ENA", "ONDO", "QNT", "ZEC")}}
 
 
 def half_risk(coin):
@@ -92,10 +94,13 @@ MANUAL = os.environ.get("MANUAL", "false").lower() == "true"
 # Шаг цены и количества на Bybit (USDT Perpetual). Если ордер не принимается — сверь в карточке контракта.
 PRICE_DEC = {"BTC": 1, "ETH": 2, "SOL": 2, "LINK": 3, "BNB": 2, "XRP": 4,
              "ADA": 4, "AVAX": 3, "DOT": 3, "LTC": 2, "BCH": 2, "NEAR": 3, "SUI": 4, "ATOM": 3,
-             "DOGE": 5, "AAVE": 2, "UNI": 3, "APT": 4}
+             "DOGE": 5, "AAVE": 2, "UNI": 3, "APT": 4,
+             "XLM": 4, "HBAR": 5, "TAO": 2, "ENA": 4, "ONDO": 4, "QNT": 1, "ZEC": 1}
 QTY_STEP = {"BTC": 0.001, "ETH": 0.01, "SOL": 0.1, "LINK": 0.1, "BNB": 0.01, "XRP": 1,
             "ADA": 1, "AVAX": 0.1, "DOT": 0.1, "LTC": 0.1, "BCH": 0.01, "NEAR": 0.1, "SUI": 10, "ATOM": 0.1,
-            "DOGE": 1, "AAVE": 0.01, "UNI": 0.1, "APT": 0.01}
+            "DOGE": 1, "AAVE": 0.01, "UNI": 0.1, "APT": 0.01,
+            # новые (08.11): шаг взят с запасом (кратен шагу Bybit) — объём округляется вниз, риск не растёт
+            "XLM": 10, "HBAR": 100, "TAO": 0.01, "ENA": 10, "ONDO": 10, "QNT": 0.1, "ZEC": 0.01}
 
 
 # ===== СЕТЬ =====
